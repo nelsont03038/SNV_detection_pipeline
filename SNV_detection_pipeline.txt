@@ -1,0 +1,185 @@
+############################################
+# Variant detection pipeline               #
+# Thomas Nelson                            #
+# thomas dot c dot nelson at gmail dot com #         
+############################################
+
+#Here is the pipeline.  I have simplified it by removing a lot 
+#of the repetative commands that are performed on multiple files.  Here I just leave the commands that illustrate 
+#performing the pipeline on two sets of paired end reads.  You will of course
+#expand these out to include all of the files for all of the samples.
+
+#Here I am analyzing data from RNA-seq on CHO (Chinese Hamster ovary) cell lines, looking for sequence
+#variants in a transgene sequence
+
+#Lines prefaced with the '#' symbol are comments or commentary.  Other lines are shell commands.
+
+#Requirements:
+#	fastqc (latest version)
+#	java runtime environment (I am using java version "1.7.0_25" just in case)
+#	trimmomatic (version 0.33)
+#	bwa (latest version)
+#	samtools (latest version)
+#	VarScan version 2 (I am using version 2.3.7)
+
+#all software is open source and can be found using Google.
+
+#Certain steps I run on a linux cluster because they need more computing resources.  Our cluster uses LSF (load sharing
+#facility) to schedule batch jobs.  These steps would be submitted as batch jobs with the "bsub" command.  bsub submits a 
+#batch job to the cluster with parameters set to specify the amount of compute resources to use.  For most steps here,
+#I use 8 CPU cores and 16 GB of RAM.  If you use different job scheduling tools, you need to use them as appropriate.
+#You need to use your judgement about how much compute power you need for each step on your given HPC environment.
+
+
+################
+# The pipeline #
+################
+
+###########
+# Data QC #
+###########
+
+#Look at read QC using the fastqc program.  Make a directory for the output.
+#Perform the analysis on each file in the current directory with fastqc.
+mkdir initialQC
+for myFile in *.gz; do fastqc $myFile --outdir=initialQC/; done
+
+#the output are nice web page reports
+
+#Do reads QC trimming, please read the trimmomatic documentation for details.
+#I recommend ruthless trimming since we have a lot of coverage and quality is more important.
+#You need to look at the QC results and decide what trimming needs to be done.
+#Here is an example of using trimmomatic to trim the first 15 bases, remove adapter sequences,
+#then do MAXINFO trim (emphasizing quality over length), and minimum read length of 36 (see trimmomatic documentation).
+#do this for all of the read file pairs, this example is for 2 sets of paired end reads.
+#You might need to do something different depending on how your set of data look.
+java -jar ../../Trimmomatic-0.33/trimmomatic-0.33.jar PE cell-line-1-clone-2-64-1_ATCACG_L001_R1_001.fastq.gz cell-line-1-clone-2-64-1_ATCACG_L001_R2_001.fastq.gz cell-line-1-clone-2-64-1_ATCACG_L001_R1_001.PE.fastq.gz cell-line-1-clone-2-64-1_ATCACG_L001_R1_001.SE.fastq.gz cell-line-1-clone-2-64-1_ATCACG_L001_R2_001.PE.fastq.gz cell-line-1-clone-2-64-1_ATCACG_L001_R2_001.SE.fastq.gz HEADCROP:15 ILLUMINACLIP:../../Trimmomatic-0.33/adapters/TruSeq3-PE-2.fa:2:30:10 MAXINFO:40:0.8 MINLEN:36
+java -jar ../../Trimmomatic-0.33/trimmomatic-0.33.jar PE cell-line-1-clone-2-64-2_CGATGT_L001_R1_001.fastq.gz cell-line-1-clone-2-64-2_CGATGT_L001_R2_001.fastq.gz cell-line-1-clone-2-64-2_CGATGT_L001_R1_001.PE.fastq.gz cell-line-1-clone-2-64-2_CGATGT_L001_R1_001.SE.fastq.gz cell-line-1-clone-2-64-2_CGATGT_L001_R2_001.PE.fastq.gz cell-line-1-clone-2-64-2_CGATGT_L001_R2_001.SE.fastq.gz HEADCROP:15 ILLUMINACLIP:../../Trimmomatic-0.33/adapters/TruSeq3-PE-2.fa:2:30:10 MAXINFO:40:0.8 MINLEN:36
+
+#I throw away the orphan reads (reads that lost mate pairs) since we have so much data.
+#remove/move/delete orphaned reads (files that contain "SE" for single ended as I defined above in the trimming step).
+#the remaining paired end reads are in files with "PE" in the name (as I defined above in the trimming step).
+#Look at read QC after trimming.
+mkdir finalQC
+for myFile in *.gz; do fastqc $myFile --outdir=finalQC/; done
+
+#the output is a nice web page report
+
+
+###########################
+# Make reference sequence #
+###########################
+
+#Create reference transcriptome by concatenating the heavy chain and light chain sequences to end of the CHO transcriptome
+#I use a CHO transcriptome assembly from Bielefeld Univeristy called "CHO_GenDBE.dna.fasta".
+#Get it here: ftp://ftp.cebitec.uni-bielefeld.de/pub/oliver/CHO/CHO_GenDBE.dna.fasta
+#The mapping quality suffers greatly if you map reads from the whole transcriptome only to a small reference 
+#sequence, therefore I use the whole transcriptome plus HC and LC.  It only adds about 20 minutes to the mapping step on the cluster.
+#hc.fa is a fasta file containing teh heavy chain sequence, same idea for lc.fa.
+cat hc.fa >> CHO_GenDBE.dna.fasta 
+cat lc.fa >> CHO_GenDBE.dna.fasta 
+#I rename the file for clarity.
+mv CHO_GenDBE.dna.fasta reference_sequence.fa
+
+#I do this for each reference sequence that I am working with.
+#Make sure the fasta header (name) for the heavy chain and light chain is something simple that you remember.
+#You will need to know it later when you extract the alignments for the HC and LC.  I just call them hc and lc here.
+
+
+###########
+# Mapping #
+###########
+
+#make BWA index for reference transcriptome
+bwa index reference_sequence.fa
+
+#do mapping (I tell bwa to use 8 threads, you might need to change this depending on your machine)
+#I am only showing a small number of mappings here, you will have one for every set of read pairs
+bwa mem -t 8 reference_sequence.fa cell-line-1-clone-2-64-1_ATCACG_L001_R1_001.PE.fastq.gz cell-line-1-clone-2-64-1_ATCACG_L001_R2_001.PE.fastq.gz > 1a.sam
+bwa mem -t 8 reference_sequence.fa cell-line-1-clone-2-64-2_CGATGT_L001_R1_001.PE.fastq.gz cell-line-1-clone-2-64-2_CGATGT_L001_R2_001.PE.fastq.gz > 1b.sam
+bwa mem -t 8 reference_sequence.fa cell-line-2-clone-2c-10-1_TTAGGC_L001_R1_001.PE.fastq.gz cell-line-2-clone-2c-10-1_TTAGGC_L001_R2_001.PE.fastq.gz > 2a.sam
+bwa mem -t 8 reference_sequence.fa cell-line-2-clone-2c-10-2_TGACCA_L001_R1_001.PE.fastq.gz cell-line-2-clone-2c-10-2_TGACCA_L001_R2_001.PE.fastq.gz > 2b.sam
+
+#index reference for samtools
+samtools faidx reference_sequence.fa
+
+#convert the SAM files to BAM files (binary sam)
+samtools import reference_sequence.fa.fai 1a.sam 1a.bam
+samtools import reference_sequence.fa.fai 1b.sam 1b.bam
+samtools import reference_sequence.fa.fai 2a.sam 2a.bam
+samtools import reference_sequence.fa.fai 2b.sam 2b.bam
+
+#sort the BAM files
+samtools sort 1a.bam 1a.sorted
+samtools sort 1b.bam 1b.sorted
+samtools sort 2a.bam 2a.sorted
+samtools sort 2b.bam 2b.sorted
+
+#If you have multiple alignment files for each replicate, you need to merge them.
+#merge the multiple sorted BAM files for each relicate like this:
+samtools merge 1.bam 1a.sorted.bam 1b.sorted.bam
+samtools merge 2.bam 2a.sorted.bam 2b.sorted.bam
+
+#sort the merged BAM file
+samtools sort 1.bam 1.sorted
+samtools sort 2.bam 2.sorted
+
+#index the merged BAM file
+samtools index 1.sorted.bam
+samtools index 2.sorted.bam
+
+
+#All of the above will look different depending on how many samples you have, how many
+#sets of read pairs you have for each replicate, etc.  So a good understanding of what is going on
+#is necessary.  Read over it and if there are any questions let me know.
+
+
+
+#########################################################################
+# Extract alignments to heavy chain and light chain reference sequences #
+#########################################################################
+
+#pull out the part of the alignment that covers the hc and lc, since that is what I am interested in here.
+samtools view -b 1.sorted.bam hc > 1.hc.bam
+samtools view -b 1.sorted.bam lc > 1.lc.bam
+samtools view -b 2.sorted.bam hc > 2.hc.bam
+samtools view -b 2.sorted.bam lc > 2.lc.bam
+
+#make samtools index for hc and lc reference sequences (put the hc and lc sequences in fasta files)
+samtools faidx hc.fa
+samtools faidx lc.fa
+
+#make samtools index for hc and lc alignment files
+samtools index hc.bam
+samtools index lc.bam
+
+
+###############
+# SNV Calling #
+###############
+
+#make pileup files
+#see the samtools documentation for the mpileup parameters explanation
+#I limit the max coverage to 50,000 fold coverage as even that is overkill
+samtools mpileup -l -C50 -d 50000 -q 1 -Q 20 -f hc.fa 1.hc.bam > 1.hc.mpileup
+samtools mpileup -l -C50 -d 50000 -q 1 -Q 20 -f lc.fa 1.lc.bam > l.lc.mpileup
+samtools mpileup -l -C50 -d 50000 -q 1 -Q 20 -f hc.fa 2.hc.bam > 2.hc.mpileup
+samtools mpileup -l -C50 -d 50000 -q 1 -Q 20 -f lc.fa 2.lc.bam > 2.lc.mpileup
+
+#variant calling
+#see the VarScan documentation for the parameter explanations
+#the minimum variant frequency I have set here to 0.4%.  I find we can reliably detect down to 0.5% without too many false positives.
+#you can experiment with the other parameters, but set like this we get all of the known variants 
+#in the control samples and no (or very few) false positives.
+java -jar ../../VarScan.v2.3.7.jar pileup2snp 1.hc.mpileup --min-coverage 10000 --min-reads2 7 --min-var-freq 0.004 --p-value 0.05 > 1.hc.results
+java -jar ../../VarScan.v2.3.7.jar pileup2snp 1.lc.mpileup --min-coverage 10000 --min-reads2 7 --min-var-freq 0.004 --p-value 0.05 > 1.lc.results
+java -jar ../../VarScan.v2.3.7.jar pileup2snp 2.hc.mpileup --min-coverage 10000 --min-reads2 7 --min-var-freq 0.004 --p-value 0.05 > 2.hc.results
+java -jar ../../VarScan.v2.3.7.jar pileup2snp 2.lc.mpileup --min-coverage 10000 --min-reads2 7 --min-var-freq 0.004 --p-value 0.05 > 2.lc.results
+
+#you can use the other programs from VarScan to look for INDELS, CNV, etc as you in a simlar fashion.
+#look at the .results files.  They are in nice user readable format.
+
+#You can also simulate a sample versus matched control experiment.  Simply sequence a cell line from a different transfection 
+#and name one as the control, the other as tumor and run "VarScan somatic" program.
+
+#Please see the varScan manual for details about the parameters and what they do.
